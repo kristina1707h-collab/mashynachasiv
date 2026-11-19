@@ -1,0 +1,56 @@
+{
+  "block_1": {
+    "title": "📚 Блок 1 — старт",
+    "items": [
+      {
+        "type": "text",
+        "caption": "PLACEHOLDER: завантажте сюди матеріали блоку 1."
+      }
+    ]
+  },
+  "block_2": {
+    "title": "📚 Блок 2",
+    "items": [
+      {
+        "type": "text",
+        "caption": "PLACEHOLDER: матеріали блоку 2."
+      }
+    ]
+  },
+  "block_3": {
+    "title": "📚 Блок 3",
+    "items": [
+      {
+        "type": "text",
+        "caption": "PLACEHOLDER: матеріали блоку 3."
+      }
+    ]
+  },
+  "block_4": {
+    "title": "📚 Блок 4",
+    "items": [
+      {
+        "type": "text",
+        "caption": "PLACEHOLDER: матеріали блоку 4."
+      }
+    ]
+  },
+  "block_5": {
+    "title": "📚 Блок 5",
+    "items": [
+      {
+        "type": "text",
+        "caption": "PLACEHOLDER: матеріали блоку 5."
+      }
+    ]
+  },
+  "block_6": {
+    "title": "🎉 Бонусний тиждень",
+    "items": [
+      {
+        "type": "text",
+        "caption": "PLACEHOLDER: повторення + відгук."
+      }
+    ]
+  }
+}
