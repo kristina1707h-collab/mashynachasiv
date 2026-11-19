@@ -1,0 +1,10 @@
+{
+  "1": [
+    {
+      "q": "ПРИКЛАД. She ___ coffee every morning.",
+      "options": ["drink", "drinks", "is drink"],
+      "correct": 1,
+      "explanation": "Present Simple, he/she/it → +s"
+    }
+  ]
+}

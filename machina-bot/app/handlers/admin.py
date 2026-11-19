@@ -1,0 +1,512 @@
+"""Команди менеджерки / Валерії / кураторів. Повний список — /admin."""
+import csv
+import io
+import re
+from datetime import datetime, timedelta
+
+from aiogram import Bot, F, Router
+from aiogram.filters import Command, CommandObject
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import BufferedInputFile, CallbackQuery, Message, ReactionTypeEmoji
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from sqlalchemy import delete, select
+
+from .. import texts as T
+from ..common import IsAdmin, IsStaff, RelayReply, access_state, main_menu, safe_send
+from ..config import settings
+from ..course import PACKAGES, access_end, day_number, has_support, open_blocks, package_title, status_of
+from ..db import ContentItem, Relay, Staff, Student, utcnow
+from ..services import (build_stats, deep_link, esc, find_students, fmt_date, get_setting, issue_student,
+                        seats_limit, seats_taken, set_setting, staff_name, student_card, admin_ids)
+from .guest import bind_and_welcome
+
+router = Router()
+PKGS = "|".join(PACKAGES)
+
+
+class Issue(StatesGroup):
+    info = State()
+
+
+class Upload(StatesGroup):
+    files = State()
+
+
+class Broadcast(StatesGroup):
+    confirm = State()
+
+
+class SetText(StatesGroup):
+    value = State()
+
+
+class SetSticker(StatesGroup):
+    wait = State()
+
+
+HELP = (
+    "🛠 <b>Адмін-панель «Машини часів»</b>\n\n"
+    "<b>Доступи</b>\n/issue [self|curator|valeria] [Імʼя @instagram] — видати код після оплати\n"
+    "/students [пакет] — список · /student &lt;id|імʼя|@нік&gt; — картка · /stats — цифри\n"
+    "/set &lt;id&gt; &lt;поле&gt; &lt;значення&gt; — name, instagram, amount, country, tz, source, upsell, notes, curator, package, calls, paid_at\n"
+    "/extend &lt;id&gt; &lt;днів&gt; · /block &lt;id&gt; · /unblock &lt;id&gt; · /calldone &lt;id&gt; · /export — CSV таблиця студентів\n"
+    "/seats [число] — місця «З Валерією»\n\n"
+    "<b>Контент</b>\n/upload auto — потім кидай файли <i>MCh_Урок01_….pdf</i> (імʼя → урок і тип автоматично)\n"
+    "/upload &lt;блок&gt; &lt;урок&gt; &lt;lesson|video|audio|exercises|answers|table&gt; — вручну · /done — вийти\n"
+    "/content [урок] — список · /delcontent &lt;id&gt;\n\n"
+    "<b>Стиль і стікери</b>\n/texts — усі тексти · /settext &lt;ключ&gt; · /resettext &lt;ключ&gt; · /setsticker &lt;подія&gt;\n\n"
+    "<b>Команда</b>\n/staff · /addstaff &lt;tg_id&gt; &lt;manager|curator|valeria&gt; &lt;імʼя&gt; [admin] · /rmstaff &lt;tg_id&gt;\n\n"
+    "<b>Тестування</b>\n/testas &lt;self|curator|valeria&gt; — стати оплаченим студентом · /guest — повернутись у вигляд «не оплатив»\n"
+    "/shift &lt;id&gt; &lt;днів&gt; — «перемотати» час, щоб побачити нові блоки й автоповідомлення\n"
+    "/broadcast [all|self|curator|valeria] текст — розсилка студентам"
+)
+
+
+@router.message(Command("admin", "help"), IsStaff())
+async def admin_help(message: Message, staff: Staff):
+    if staff.is_admin:
+        await message.answer(HELP)
+    else:
+        await message.answer("Ти куратор 💜 Домашки приходять сюди. Щоб відповісти студенту — просто зроби <b>реплай</b> на його повідомлення (текст, голосове чи файл).")
+
+
+# ───────── видача доступів ─────────
+def _parse_info(text: str) -> tuple[str, str]:
+    ig = re.search(r"@[\w.]+", text)
+    insta = ig.group(0) if ig else ""
+    name = re.sub(r"@[\w.]+", "", text).strip(" ,-—")
+    return name, insta
+
+
+async def _do_issue(message: Message, session, bot: Bot, pkg: str, info: str) -> None:
+    name, insta = _parse_info(info)
+    st = await issue_student(session, pkg, name=name, instagram=insta, source="manual")
+    await session.commit()
+    link = deep_link(st.code)
+    cur = esc(await staff_name(session, st.curator_tg_id)) if has_support(pkg) else "—"
+    await message.answer(
+        f"✅ Код видано · #{st.id} · {package_title(pkg)} · {st.amount} грн\n👩‍🏫 куратор: {cur}\n"
+        f"Код: <code>{st.code}</code>\n\n<b>Скопіюй і надішли в Direct:</b>\n"
+        f"<code>You DID it! 🎉 Оплату отримали. Ось твій квиток у «Машину часів» → {link}</code>")
+    if pkg == "valeria":
+        lim, taken = await seats_limit(session), await seats_taken(session)
+        if taken >= lim:
+            for a in await admin_ids(session):
+                await safe_send(bot, a, f"⚠️ Місця «З Валерією»: {taken}/{lim}. Вимкни посилання Pay на цей пакет!")
+
+
+@router.message(Command("issue"), IsAdmin())
+async def cmd_issue(message: Message, command: CommandObject, session, bot: Bot, state: FSMContext):
+    await state.clear()
+    args = (command.args or "").split(maxsplit=1)
+    if args and args[0] in PACKAGES:
+        return await _do_issue(message, session, bot, args[0], args[1] if len(args) > 1 else "")
+    kb = InlineKeyboardBuilder()
+    for k in PACKAGES:
+        kb.button(text=package_title(k), callback_data=f"iss:{k}")
+    kb.adjust(1)
+    await message.answer("Який пакет оплатили?", reply_markup=kb.as_markup())
+
+
+@router.callback_query(F.data.startswith("iss:"), IsAdmin())
+async def cb_issue(cb: CallbackQuery, state: FSMContext):
+    await state.set_state(Issue.info)
+    await state.update_data(pkg=cb.data.split(":")[1])
+    await cb.message.answer("Напиши імʼя та @instagram одним повідомленням (або «-», щоб пропустити):")
+    await cb.answer()
+
+
+@router.message(Issue.info, IsAdmin())
+async def issue_info(message: Message, session, bot: Bot, state: FSMContext):
+    pkg = (await state.get_data())["pkg"]
+    await state.clear()
+    await _do_issue(message, session, bot, pkg, "" if (message.text or "").strip() == "-" else (message.text or ""))
+
+
+# ───────── тестування ─────────
+@router.message(Command("testas"), IsAdmin())
+async def cmd_testas(message: Message, command: CommandObject, session, bot: Bot, state: FSMContext):
+    await state.clear()
+    pkg = (command.args or "").strip()
+    if pkg not in PACKAGES:
+        return await message.answer("Використання: /testas self | curator | valeria")
+    st = await issue_student(session, pkg, name=message.from_user.first_name or "Тест", is_test=True, source="test")
+    st.curator_tg_id = message.from_user.id if has_support(pkg) else None  # домашки прийдуть тобі
+    uid = message.from_user.id
+    from sqlalchemy import update
+    await session.execute(update(Student).where(Student.tg_id == uid).values(tg_id=None))
+    st.tg_id, st.tg_username = uid, message.from_user.username or ""
+    st.first_name, st.activated_at, st.last_active_at = message.from_user.first_name or "", utcnow(), utcnow()
+    from ..services import mark_sent
+    await mark_sent(session, st.id, "block_open:1")
+    await session.commit()
+    await message.answer(f"🧪 Тестовий студент #{st.id} ({package_title(pkg)}). Нижче — те, що побачить оплачена людина. "
+                         f"/shift {st.id} 7 — відкрити наступний блок · /guest — вигляд «не оплатив».")
+    await bind_and_welcome(message, session, bot, st)
+
+
+@router.message(Command("guest"), IsStaff())
+async def cmd_guest(message: Message, session, student, state: FSMContext):
+    await state.clear()
+    from sqlalchemy import update
+    await session.execute(update(Student).where(Student.tg_id == message.from_user.id, Student.is_test == True)  # noqa: E712
+                          .values(tg_id=None))
+    from aiogram.types import ReplyKeyboardRemove
+    await message.answer("Ок, тепер ти для бота — людина, що не оплатила. Напиши /start 👇", reply_markup=ReplyKeyboardRemove())
+
+
+@router.message(Command("shift"), IsAdmin())
+async def cmd_shift(message: Message, command: CommandObject, session):
+    try:
+        sid, days = (command.args or "").split()
+        st = await session.get(Student, int(sid))
+        st.paid_at -= timedelta(days=int(days))
+    except Exception:
+        return await message.answer("Використання: /shift <id> <днів> (мінус днів від дати оплати)")
+    await message.answer(f"⏩ #{st.id}: день {day_number(st.paid_at, utcnow())}. Автоповідомлення прийдуть за ≤5 хв.")
+
+
+# ───────── студенти ─────────
+@router.message(Command("students"), IsAdmin())
+async def cmd_students(message: Message, command: CommandObject, session):
+    q = select(Student).where(Student.is_test == False).order_by(Student.id.desc()).limit(40)  # noqa: E712
+    if command.args and command.args.strip() in PACKAGES:
+        q = q.where(Student.package == command.args.strip())
+    rows = (await session.execute(q)).scalars().all()
+    now = utcnow()
+    lines = [f"#{r.id} {esc(r.display)} · {r.package} · {status_of(r.paid_at, now, r.extra_days, r.blocked)}"
+             f"{'' if r.tg_id else ' · ⏳ не активовано'}" for r in rows]
+    await message.answer("\n".join(lines) or "Поки нікого.")
+
+
+@router.message(Command("student"), IsAdmin())
+async def cmd_student(message: Message, command: CommandObject, session):
+    rows = await find_students(session, command.args or "")
+    if not rows:
+        return await message.answer("Не знайшла 🤔")
+    for r in rows[:5]:
+        await message.answer(await student_card(session, r))
+
+
+@router.message(Command("stats"), IsAdmin())
+async def cmd_stats(message: Message, session):
+    await message.answer(await build_stats(session))
+
+
+@router.message(Command("seats"), IsAdmin())
+async def cmd_seats(message: Message, command: CommandObject, session):
+    if command.args and command.args.strip().isdigit():
+        await set_setting(session, "valeria_seats", command.args.strip())
+    await message.answer(f"⭐ «З Валерією»: зайнято {await seats_taken(session)} з {await seats_limit(session)}")
+
+
+@router.message(Command("set"), IsAdmin())
+async def cmd_set(message: Message, command: CommandObject, session):
+    try:
+        sid, field, value = (command.args or "").split(maxsplit=2)
+        st = await session.get(Student, int(sid))
+        if field in ("amount", "calls", "curator"):
+            attr = {"calls": "calls_used", "curator": "curator_tg_id", "amount": "amount"}[field]
+            setattr(st, attr, int(value))
+        elif field == "paid_at":
+            st.paid_at = datetime.fromisoformat(value)
+        elif field == "package":
+            assert value in PACKAGES
+            st.package = value
+        elif field in ("name", "instagram", "country", "tz", "source", "upsell", "notes"):
+            setattr(st, field, value)
+        else:
+            raise ValueError
+    except Exception:
+        return await message.answer("Використання: /set <id> <поле> <значення>. Поля — див. /admin")
+    await message.answer("✅\n" + await student_card(session, st))
+
+
+@router.message(Command("extend"), IsAdmin())
+async def cmd_extend(message: Message, command: CommandObject, session):
+    try:
+        sid, days = (command.args or "").split()
+        st = await session.get(Student, int(sid))
+        st.extra_days += int(days)
+    except Exception:
+        return await message.answer("Використання: /extend <id> <днів>")
+    await message.answer(f"✅ Доступ #{st.id} тепер до {fmt_date(access_end(st.paid_at, st.extra_days))}")
+
+
+@router.message(Command("block", "unblock", "calldone"), IsAdmin())
+async def cmd_flags(message: Message, command: CommandObject, session):
+    try:
+        st = await session.get(Student, int((command.args or "").strip()))
+        if command.command == "block":
+            st.blocked = True
+        elif command.command == "unblock":
+            st.blocked = False
+        else:
+            st.calls_used += 1
+    except Exception:
+        return await message.answer(f"Використання: /{command.command} <id>")
+    await message.answer("✅\n" + await student_card(session, st))
+
+
+@router.message(Command("export"), IsAdmin())
+async def cmd_export(message: Message, session):
+    rows = (await session.execute(select(Student).where(Student.is_test == False).order_by(Student.id))).scalars().all()  # noqa: E712
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["ID", "Імʼя", "Instagram", "Telegram", "Пакет", "Сума", "Дата оплати", "Країна", "Часовий пояс",
+                "Куратор", "Джерело", "Статус", "Допродажі", "Дзвінків", "Код", "Активовано"])
+    now = utcnow()
+    for r in rows:
+        w.writerow([r.id, r.name, r.instagram, f"@{r.tg_username}" if r.tg_username else r.tg_id or "", r.package, r.amount,
+                    fmt_date(r.paid_at), r.country, r.tz, await staff_name(session, r.curator_tg_id), r.source,
+                    status_of(r.paid_at, now, r.extra_days, r.blocked), r.upsell, r.calls_used, r.code, "так" if r.tg_id else "ні"])
+    await message.answer_document(BufferedInputFile(buf.getvalue().encode("utf-8-sig"), filename="machina_students.csv"))
+
+
+# ───────── команда ─────────
+@router.message(Command("staff"), IsAdmin())
+async def cmd_staff(message: Message, session):
+    rows = (await session.execute(select(Staff))).scalars().all()
+    await message.answer("\n".join(f"{s.tg_id} · {esc(s.name)} · {s.role}{' · admin' if s.is_admin else ''}" for s in rows) or "Порожньо")
+
+
+@router.message(Command("addstaff"), IsAdmin())
+async def cmd_addstaff(message: Message, command: CommandObject, session):
+    parts = (command.args or "").split()
+    try:
+        tg, role = int(parts[0]), parts[1]
+        assert role in ("manager", "curator", "valeria")
+        is_admin = parts[-1] == "admin"
+        name = " ".join(parts[2:-1] if is_admin else parts[2:])
+    except Exception:
+        return await message.answer("Використання: /addstaff <tg_id> <manager|curator|valeria> <імʼя> [admin]")
+    row = await session.get(Staff, tg)
+    if row:
+        row.role, row.name, row.is_admin = role, name, is_admin
+    else:
+        session.add(Staff(tg_id=tg, role=role, name=name, is_admin=is_admin))
+    await message.answer("✅ Додано")
+
+
+@router.message(Command("rmstaff"), IsAdmin())
+async def cmd_rmstaff(message: Message, command: CommandObject, session):
+    try:
+        await session.execute(delete(Staff).where(Staff.tg_id == int(command.args.strip())))
+    except Exception:
+        return await message.answer("Використання: /rmstaff <tg_id>")
+    await message.answer("✅ Видалено")
+
+
+# ───────── контент ─────────
+def _extract(m: Message):
+    if m.video:
+        return "video", m.video.file_id, m.video.file_name or ""
+    if m.document:
+        return "document", m.document.file_id, m.document.file_name or ""
+    if m.audio:
+        return "audio", m.audio.file_id, m.audio.file_name or m.audio.title or ""
+    if m.voice:
+        return "voice", m.voice.file_id, ""
+    if m.photo:
+        return "photo", m.photo[-1].file_id, ""
+    return None
+
+
+def _auto(ftype: str, text: str):
+    low = text.lower()
+    if "таблиц" in low or "table" in low or "tablic" in low:
+        return 0, 0, "table"
+    m = re.search(r"(?:урок|urok|lesson|l)[\s_\-]*0*(\d{1,2})", low)
+    if not m:
+        return None
+    n = int(m.group(1))
+    if ftype == "video":
+        kind = "video"
+    elif ftype in ("audio", "voice"):
+        kind = "audio"
+    elif any(w in low for w in ("розбір", "razbir", "answer", "key")):
+        kind = "answers"
+    elif any(w in low for w in ("вправ", "exerc", "practice")):
+        kind = "exercises"
+    else:
+        kind = "lesson"
+    return (n + 1) // 2, n, kind
+
+
+@router.message(Command("upload"), IsAdmin())
+async def cmd_upload(message: Message, command: CommandObject, state: FSMContext):
+    a = (command.args or "").split()
+    if a == ["auto"]:
+        await state.set_state(Upload.files)
+        await state.update_data(mode="auto")
+        return await message.answer("📥 Режим <b>auto</b>. Кидай файли <i>як файл (без стиснення!)</i> з іменами на кшталт "
+                                    "<code>MCh_Урок01_Present-Simple.pdf</code>, <code>MCh_Урок01_Розбір.pdf</code>, "
+                                    "<code>MCh_Урок01_Вправи.pdf</code>, <code>MCh_Урок01_Відео.mp4</code>, "
+                                    "<code>MCh_Таблиця.pdf</code>. Вийти — /done")
+    try:
+        b, l, kind = int(a[0]), int(a[1]), a[2]
+        assert kind in ("lesson", "video", "audio", "exercises", "answers", "table")
+    except Exception:
+        return await message.answer("Використання: /upload auto  або  /upload <блок> <урок> <тип>")
+    await state.set_state(Upload.files)
+    await state.update_data(mode="manual", block=b, lesson=l, kind=kind)
+    await message.answer(f"📥 Блок {b}, урок {l}, тип {kind}. Кидай файли. Вийти — /done")
+
+
+@router.message(Command("done"), IsStaff())
+async def cmd_done(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("Готово 👌")
+
+
+@router.message(Upload.files, IsAdmin())
+async def upload_file(message: Message, session, state: FSMContext):
+    ex = _extract(message)
+    if not ex:
+        return await message.answer("Це не файл 🤔 Надішли документ, відео, аудіо чи голосове. /done — вийти.")
+    ftype, fid, fname = ex
+    data = await state.get_data()
+    caption = message.caption or ""
+    if data["mode"] == "auto":
+        res = _auto(ftype, f"{fname} {caption}")
+        if not res:
+            return await message.answer(f"Не бачу номера уроку в назві «{esc(fname)}». Перейменуй або /upload <блок> <урок> <тип>.")
+        b, l, kind = res
+    else:
+        b, l, kind = data["block"], data["lesson"], data["kind"]
+    title = caption or re.sub(r"\.[A-Za-z0-9]{2,4}$", "", fname).replace("_", " ").replace("MCh ", "").strip()
+    it = ContentItem(block=b, lesson=l, kind=kind, title=title[:300], file_id=fid, file_type=ftype)
+    session.add(it)
+    await session.flush()
+    await message.answer(f"✓ #{it.id} · урок {l} · {kind} · {esc(title)}")
+
+
+@router.message(Command("content"), IsAdmin())
+async def cmd_content(message: Message, command: CommandObject, session):
+    q = select(ContentItem).order_by(ContentItem.lesson, ContentItem.id)
+    if command.args and command.args.strip().isdigit():
+        q = q.where(ContentItem.lesson == int(command.args.strip()))
+    rows = (await session.execute(q)).scalars().all()
+    await message.answer("\n".join(f"#{r.id} · урок {r.lesson} · {r.kind} · {esc(r.title)}" for r in rows)[:4000] or "Контенту ще нема.")
+
+
+@router.message(Command("delcontent"), IsAdmin())
+async def cmd_delcontent(message: Message, command: CommandObject, session):
+    try:
+        await session.execute(delete(ContentItem).where(ContentItem.id == int(command.args.strip())))
+    except Exception:
+        return await message.answer("Використання: /delcontent <id>")
+    await message.answer("✅ Видалено")
+
+
+# ───────── тексти й стікери ─────────
+@router.message(Command("texts"), IsAdmin())
+async def cmd_texts(message: Message):
+    keys = "\n".join(f"<code>{k}</code>" for k in T.DEFAULTS)
+    await message.answer(f"Ключі текстів (змінити: /settext ключ):\n{keys}"[:4000])
+
+
+@router.message(Command("settext"), IsAdmin())
+async def cmd_settext(message: Message, command: CommandObject, state: FSMContext):
+    key = (command.args or "").strip()
+    if key not in T.DEFAULTS:
+        return await message.answer("Невідомий ключ. Список — /texts")
+    await state.set_state(SetText.value)
+    await state.update_data(key=key)
+    await message.answer(f"Поточний текст:\n\n<code>{esc(T._overrides.get(key) or T.DEFAULTS[key])}</code>\n\n"
+                         "Надішли новий (HTML і {плейсхолдери} можна, лише не видаляй їх). /cancel — скасувати.")
+
+
+@router.message(SetText.value, IsAdmin(), F.text)
+async def settext_value(message: Message, session, state: FSMContext):
+    if message.text.startswith("/cancel"):
+        await state.clear()
+        return await message.answer(T.tx("cancelled"))
+    key = (await state.get_data())["key"]
+    await state.clear()
+    T.put_override(key, message.html_text)
+    await set_setting(session, f"text:{key}", message.html_text)
+    await message.answer("✅ Збережено. Дивись у боті.")
+
+
+@router.message(Command("resettext"), IsAdmin())
+async def cmd_resettext(message: Message, command: CommandObject, session):
+    key = (command.args or "").strip()
+    T.put_override(key, None)
+    from ..db import Setting
+    await session.execute(delete(Setting).where(Setting.key == f"text:{key}"))
+    await message.answer("✅ Повернула стандартний текст.")
+
+
+@router.message(Command("setsticker"), IsAdmin())
+async def cmd_setsticker(message: Message, command: CommandObject, state: FSMContext):
+    ev = (command.args or "").strip()
+    if ev not in T.STICKER_EVENTS:
+        return await message.answer("Події:\n" + "\n".join(f"<code>{k}</code> — {v}" for k, v in T.STICKER_EVENTS.items())
+                                    + "\n\nПриклад: /setsticker welcome, потім надішли стікер.")
+    await state.set_state(SetSticker.wait)
+    await state.update_data(ev=ev)
+    await message.answer("Надішли стікер 👇 (/cancel — скасувати)")
+
+
+@router.message(SetSticker.wait, IsAdmin())
+async def setsticker_value(message: Message, session, state: FSMContext):
+    if not message.sticker:
+        await state.clear()
+        return await message.answer(T.tx("cancelled"))
+    ev = (await state.get_data())["ev"]
+    await state.clear()
+    await set_setting(session, f"sticker:{ev}", message.sticker.file_id)
+    await message.answer(f"✅ Стікер для «{T.STICKER_EVENTS[ev]}» збережено.")
+
+
+# ───────── розсилка ─────────
+@router.message(Command("broadcast"), IsAdmin())
+async def cmd_broadcast(message: Message, command: CommandObject, session, state: FSMContext):
+    parts = (command.args or "").split(maxsplit=1)
+    if not parts:
+        return await message.answer("Використання: /broadcast [all|self|curator|valeria] текст")
+    target, text = ("all", command.args) if parts[0] not in (*PACKAGES, "all") else (parts[0], parts[1] if len(parts) > 1 else "")
+    q = select(Student).where(Student.tg_id.is_not(None), Student.blocked == False, Student.is_test == False)  # noqa: E712
+    if target != "all":
+        q = q.where(Student.package == target)
+    ids = [s.tg_id for s in (await session.execute(q)).scalars() if access_state(s) == "ok"]
+    await state.set_state(Broadcast.confirm)
+    await state.update_data(ids=ids, text=text)
+    kb = InlineKeyboardBuilder()
+    kb.button(text=f"✅ Надіслати ({len(ids)})", callback_data="bc:yes")
+    kb.button(text="✖ Скасувати", callback_data="bc:no")
+    await message.answer(f"Отримувачів: {len(ids)}\n\n{text}", reply_markup=kb.as_markup())
+
+
+@router.callback_query(F.data.startswith("bc:"), IsAdmin())
+async def cb_broadcast(cb: CallbackQuery, bot: Bot, state: FSMContext):
+    data = await state.get_data()
+    await state.clear()
+    if cb.data == "bc:no" or not data.get("ids"):
+        await cb.message.answer(T.tx("cancelled"))
+        return await cb.answer()
+    import asyncio
+    ok = 0
+    for tid in data["ids"]:
+        ok += await safe_send(bot, tid, data["text"], protect_content=True)
+        await asyncio.sleep(0.05)
+    await cb.message.answer(f"✅ Надіслано: {ok}/{len(data['ids'])}")
+    await cb.answer()
+
+
+# ───────── відповідь персоналу студенту (реплай) ─────────
+@router.message(RelayReply())
+async def staff_reply(message: Message, relay: Relay, session, bot: Bot):
+    st = await session.get(Student, relay.student_id)
+    if not st or not st.tg_id:
+        return await message.answer("Студент ще не активував бот 🤔")
+    label = {"hw": "💬 Відповідь на домашку", "support": "💬 Підтримка", "call": "📞 Щодо дзвінка",
+             "feedback": "💜 Дякуємо за відгук"}.get(relay.kind, "💬")
+    await bot.send_message(st.tg_id, f"<b>{label}</b>")
+    await bot.copy_message(st.tg_id, message.chat.id, message.message_id)
+    try:
+        await message.react([ReactionTypeEmoji(emoji="👍")])
+    except Exception:
+        await message.answer("✓ Надіслано")
