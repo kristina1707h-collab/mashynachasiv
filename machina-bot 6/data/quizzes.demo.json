@@ -1,0 +1,54 @@
+{
+  "1": [
+    {
+      "q": "She ___ coffee every morning.",
+      "options": [
+        "drink",
+        "drinks",
+        "is drink"
+      ],
+      "correct": 1,
+      "explanation": "Present Simple, he/she/it → додаємо -s: drinks."
+    },
+    {
+      "q": "I ___ in Kyiv.",
+      "options": [
+        "live",
+        "lives",
+        "am live"
+      ],
+      "correct": 0,
+      "explanation": "З I/you/we/they дієслово без закінчення: I live."
+    },
+    {
+      "q": "___ he work on Saturdays?",
+      "options": [
+        "Do",
+        "Does",
+        "Is"
+      ],
+      "correct": 1,
+      "explanation": "Питання з he/she/it → Does + дієслово без -s."
+    },
+    {
+      "q": "They ___ TV in the evening.",
+      "options": [
+        "doesn't watch",
+        "don't watch",
+        "aren't watch"
+      ],
+      "correct": 1,
+      "explanation": "Заперечення з they → don't + дієслово."
+    },
+    {
+      "q": "Mark ___ to school by bus.",
+      "options": [
+        "go",
+        "goes",
+        "going"
+      ],
+      "correct": 1,
+      "explanation": "Mark = he → goes (-es після -o)."
+    }
+  ]
+}

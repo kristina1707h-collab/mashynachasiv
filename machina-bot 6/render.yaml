@@ -1,0 +1,38 @@
+# Render Blueprint: New + → Blueprint → вибрати репозиторій.
+# Базу Postgres створи вручну в Render (New + → PostgreSQL) і встав Internal Database URL у DATABASE_URL.
+# УВАГА: безкоштовний Postgres на Render має обмежений термін життя — для курсу на 3+ місяці бери платний план.
+services:
+  - type: web
+    name: machina-chasu-bot
+    runtime: docker
+    plan: starter            # бот має працювати без «засинання» (планувальник + вебхуки)
+    healthCheckPath: /health
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_IDS
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: PAYMENT_WEBHOOK_SECRET
+        generateValue: true
+      - key: DIRECT_URL
+        sync: false
+      - key: CALL_BOOKING_URL
+        sync: false
+      - key: FEEDBACK_URL
+        sync: false
+      - key: EXTEND_URL
+        sync: false
+      - key: WORKBOOK_URL
+        sync: false
+      - key: GRAMMAR_URL
+        sync: false
+      - key: PRICE_CHANGE_AT
+        value: "2026-12-02T00:00"
+      - key: VALERIA_SEATS_LIMIT
+        value: "5"
+      - key: QUIET_HOURS
+        value: "1"
+      - key: ANSWERS_NEXT_DAY
+        value: "1"
